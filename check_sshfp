@@ -20,7 +20,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-# Usage: check_sshfp [hostname]
+# Usage: check_sshfp --help
+#
 # Considers existing SSHFPs for non-offered key types and missing SSHFPs for
 # offered key types to be WARNING, and incorrect SSHFPs to be CRITICAL.
 
@@ -31,6 +32,10 @@ import hashlib
 import base64
 import binascii
 import traceback
+import argparse
+
+
+VERSION = "0.1"
 
 # SSHFP algorithm numbers to their SSH names.
 SSHFP_KEY_ALGS = {
@@ -47,26 +52,80 @@ SSHFP_FP_ALGS = {
 }
 
 
-def check_sshfp_for_host(hostname):
+def nagios_ok(msg: str) -> None:
+    print("SSHFP OK - " + msg)
+    sys.exit(0)
+
+
+def nagios_warning(msg: str) -> None:
+    print("SSHFP WARNING - " + msg)
+    sys.exit(1)
+
+
+def nagios_critical(msg: str) -> None:
+    print("SSHFP CRITICAL - " + msg)
+    sys.exit(2)
+
+
+def nagios_unknown(msg: str) -> None:
+    print("SSHFP UNKNOWN - " + msg)
+    sys.exit(3)
+
+def create_resolver(dnssec: bool = True,
+                    timeout: int = None,
+                    nameserver: str = None) -> dns.resolver.Resolver:
+    resolver = dns.resolver.Resolver()
+
+    if timeout and timeout != 0:
+        resolver.lifetime = timeout
+
+    if nameserver:
+        resolver.nameservers = [nameserver]
+
+    if dnssec:
+        resolver.edns = 0
+        resolver.payload = 1280
+        resolver.ednsflags = dns.flags.DO
+
+    return resolver
+
+def check_dns_response_auth(response: dns.resolver.Answer) -> bool:
+    if response.response.flags & dns.flags.AD:
+        return True
+    else:
+        return False
+
+
+
+def check_sshfp_for_host(args: argparse.Namespace):
+
+    resolver = create_resolver(dnssec=args.dnssec, timeout=args.timeout, nameserver=args.nameserver)
+
+#    sshfp_result = resolver.query(hostname,dns.rdatatype.SSHFP, raise_on_no_answer=False)
 
     # First, get the SSHFPs.
-    sshfp_result = dns.resolver.query(hostname, dns.rdatatype.SSHFP, raise_on_no_answer=False)
-    if sshfp_result.rrset is None:
-        print('SSHFP WARNING: No records present.')
-        sys.exit(1)
+    try:
+        sshfp_records = resolver.resolve(args.host, dns.rdatatype.SSHFP, raise_on_no_answer=False)
+    except dns.resolver.NXDOMAIN:
+        nagios_critical("No SSHFP records found: {}".format(args.host))
+    except dns.exception.Timeout:
+        nagios_unknown("DNS query timeout: {}".format(args.host))
+
+    if args.dnssec and not check_dns_response_auth(sshfp_records):
+        nagios_unknown("DNS query not DNSSEC validated")
+
 
     # Turn them into a more convenient representation.
     sshfps = {}
-    for record in sshfp_result.rrset:
+    for record in sshfp_records.rrset:
         sshfps.setdefault(SSHFP_KEY_ALGS[record.algorithm], {'seen': False, 'fingerprints': []})['fingerprints'].append((SSHFP_FP_ALGS[record.fp_type], record.fingerprint))
-    #print(sshfps)
 
     # ssh-keyscan puts status info on stderr, and there's no option
     # to make it not do that. But we still want real errors to be
     # passed through on stderr... and keys (on stdout) might be big,
     # so we might deadlock if we read all the way through one stdio
     # stream without also reading the other simultaneously... DansGame.
-    subproc = subprocess.Popen(['ssh-keyscan', '-t', 'rsa,dsa,ecdsa,ed25519', hostname], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subproc = subprocess.Popen(['ssh-keyscan', '-t', 'rsa,dsa,ecdsa,ed25519', '-p', str(args.port), args.host], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout, stderr = subproc.communicate()
     cleaned_stderr = '\n'.join(line for line in stderr.decode().splitlines() if not line.startswith('#'))
     # It can also return 0 even if there were critical problems
@@ -82,31 +141,49 @@ def check_sshfp_for_host(hostname):
         try:
             sshfp = sshfps[algorithm]
         except KeyError:
-            print('SSHFP WARNING: No record for algorithm %s offered by server.' % (algorithm,))
-            sys.exit(1)
+            nagios_warning("No record for algorithm {} offered by server.".format(algorithm))
 
         sshfp['seen'] = True
         for hashfunc, correct_fp in sshfp['fingerprints']:
             observed_fp = hashfunc(base64.b64decode(key.encode()))
             if observed_fp != correct_fp:
-                print('SSHFP CRITICAL: Fingerprint mismatch: SSHFP %s, observed %s.' % (binascii.hexlify(correct_fp).decode(), binascii.hexlify(observed_fp).decode()))
-                sys.exit(2)
+                nagios_critical("Fingerprint mismatch: SSHFP {}, observed {}.".format(binascii.hexlify(correct_fp).decode(),binascii.hexlify(observed_fp).decode()))
 
     # Check that there are no extra SSHFPs.
     for algorithm, sshfp in sshfps.items():
         if not sshfp['seen']:
-            print('SSHFP WARNING: Record present for algorithm %s not offered by server.' % (algorithm,))
-            sys.exit(1)
+            nagios_warning("Record present for algorithm {} not offered by server.".format(algorithm))
 
-    print('SSHFP OK: %d records for %d algorithms' % (len(sshfp_result.rrset), len(sshfps)))
-    sys.exit(0)
+    nagios_ok("{} records for {} algorithms.".format(len(sshfp_records.rrset),len(sshfps)))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=""" Nagios/Icinga plugin for checking SSHFP records.
+                                     It compares SSHFP records against the fingerprints of the SSH host keys provided
+                                     by a corresponding service.""")
+
+    parser.add_argument("--host", "-H", dest="host", required=True, help="Hostname to check.")
+    parser.add_argument("--port", "-p", type=int, required=True, help="TCP port to check.")
+    parser.add_argument("--no-dnssec", dest="dnssec", action="store_false",
+                        help="Continue even when DNS replies aren't DNSSEC authenticated.")
+    parser.add_argument("--nameserver", help="Use a custom nameserver.")
+    parser.add_argument("--timeout", type=int, default=10, help="Network timeout in sec. Default: 10")
+    parser.add_argument("--version", action="version", version="%(prog)s " + VERSION)
+    args = parser.parse_args()
+
+    pyver = sys.version_info
+    if pyver[0] < 3 or (pyver[0] == 3 and pyver[1] < 4):
+        nagios_unknown("check_dane requires Python >= 3.4")
+
+    if args.port < 1 or args.port > 65535:
+        nagios_unknown("Invalid port")
+
+    if args.timeout < 0:
+        nagios_unknown("Invalid timeout argument")
+
+    check_sshfp_for_host(args)
 
 
 
 if __name__ == '__main__':
-    # Turn exceptions into UNKNOWN.
-    try:
-        check_sshfp_for_host(sys.argv[1])
-    except Exception:
-        sys.stdout.write('SSHFP UNKNOWN: ' + traceback.format_exc())
-        sys.exit(3)
+    main()
