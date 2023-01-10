@@ -105,7 +105,7 @@ def check_sshfp_for_host(args: argparse.Namespace):
 
     # First, get the SSHFPs.
     try:
-        sshfp_records = resolver.query(args.host, dns.rdatatype.SSHFP, raise_on_no_answer=False)
+        sshfp_records = resolver.resolve(args.host, dns.rdatatype.SSHFP, raise_on_no_answer=False)
     except dns.resolver.NXDOMAIN:
         nagios_critical("No SSHFP records found: {}".format(args.host))
     except dns.exception.Timeout:
